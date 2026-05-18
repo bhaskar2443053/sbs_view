@@ -1,0 +1,10 @@
+numpy
+opencv-python
+roslibpy
+aiohttp
+aiortc
+av
+sounddevice
+livekit
+livekit-api
+# The ZED SDK provides the pyzed wheel; install it manually.
