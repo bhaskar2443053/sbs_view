@@ -16,7 +16,5 @@ Thumbs.db
 certs/
 clarius_captures/
 logs/
-livekit_bin/
-livekit.local.yaml
 remote_voice_state.json
 *.jsonl
