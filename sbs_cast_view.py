@@ -81,18 +81,15 @@ CLARIUS_OVERLAY_OFF_NOTICE_SECONDS = 3.0
 FORCE_GAUGE_MAX_KG = 2.5
 FORCE_ALERT_THRESHOLD_KG = 1.5
 FORCE_ALERT_RELEASE_THRESHOLD_KG = 1.35
-FORCE_ALERT_FIXED_RATE_REFERENCE_KG = 2.2
 FORCE_ALERT_TONE_HZ = 1400
 FORCE_ALERT_BEEP_MS = 80
 FORCE_ALERT_MAX_INTERVAL_S = 1.0
 FORCE_ALERT_MIN_INTERVAL_S = 0.1
 FORCE_ALERT_HOLD_S = 0.35
 FORCE_ENDPOINT_VALUE_HOLD_S = 0.35
-FORCE_ALERT_ATTACK_S = 0.05
-FORCE_ALERT_RELEASE_S = 0.16
 FORCE_ALERT_RECOVERY_RETRY_S = 0.1
 FORCE_DIRECT_RECONNECT_DELAY_S = 2.0
-FORCE_LOOP_SLEEP_S = 0.003
+FORCE_LOOP_SLEEP_S = 0.001
 FORCE_DISPLAY_ATTACK_S = 0.04
 FORCE_DISPLAY_RELEASE_S = 0.09
 
@@ -276,20 +273,21 @@ def _list_monitors() -> list[Dict[str, int]]:
 
 
 def _get_force_alert_interval_s(force_kg: float) -> Optional[float]:
-    """Return a fixed alert interval once force exceeds threshold."""
+    """Return beep interval with beep rate linearly proportional to force."""
     if force_kg < FORCE_ALERT_THRESHOLD_KG:
         return None
-    reference_kg = min(
-        max(FORCE_ALERT_FIXED_RATE_REFERENCE_KG, FORCE_ALERT_THRESHOLD_KG),
+    clamped_force_kg = min(
+        max(force_kg, FORCE_ALERT_THRESHOLD_KG),
         FORCE_GAUGE_MAX_KG,
     )
-    ratio = (reference_kg - FORCE_ALERT_THRESHOLD_KG) / max(
+    ratio = (clamped_force_kg - FORCE_ALERT_THRESHOLD_KG) / max(
         FORCE_GAUGE_MAX_KG - FORCE_ALERT_THRESHOLD_KG,
         1e-6,
     )
-    return FORCE_ALERT_MAX_INTERVAL_S - (
-        ratio * (FORCE_ALERT_MAX_INTERVAL_S - FORCE_ALERT_MIN_INTERVAL_S)
-    )
+    min_rate_hz = 1.0 / max(FORCE_ALERT_MAX_INTERVAL_S, 1e-6)
+    max_rate_hz = 1.0 / max(FORCE_ALERT_MIN_INTERVAL_S, 1e-6)
+    beep_rate_hz = min_rate_hz + (ratio * (max_rate_hz - min_rate_hz))
+    return 1.0 / max(beep_rate_hz, 1e-6)
 
 
 class ForceAlertAudioPlayer:
@@ -368,25 +366,18 @@ def _run_force_alert_loop(
     is_running: Callable[[], bool],
     get_force_value: Callable[[], float],
 ) -> None:
-    """Drive repetitive force alert beeps with smoothing and reconnect tolerance."""
+    """Drive repetitive force alert beeps with low-latency force-based cadence."""
     player = ForceAlertAudioPlayer()
     player.start()
     gate_open = False
     hold_until_monotonic = 0.0
-    smoothed_force_kg = 0.0
-    last_tick_monotonic = time.monotonic()
-    next_beep_monotonic = last_tick_monotonic
+    next_beep_monotonic = time.monotonic()
+    last_beep_started_monotonic = 0.0
 
     try:
         while is_running():
             now = time.monotonic()
             current_force_kg = max(0.0, float(get_force_value()))
-            dt = max(0.0, now - last_tick_monotonic)
-            last_tick_monotonic = now
-
-            smoothing_s = FORCE_ALERT_ATTACK_S if current_force_kg >= smoothed_force_kg else FORCE_ALERT_RELEASE_S
-            alpha = 1.0 - math.exp(-dt / max(smoothing_s, 1e-6))
-            smoothed_force_kg += alpha * (current_force_kg - smoothed_force_kg)
 
             gate_was_open = gate_open
             if current_force_kg >= FORCE_ALERT_THRESHOLD_KG:
@@ -396,25 +387,32 @@ def _run_force_alert_loop(
                 gate_open = False
 
             if gate_open and not gate_was_open:
-                smoothed_force_kg = max(smoothed_force_kg, current_force_kg)
                 next_beep_monotonic = now
+                last_beep_started_monotonic = 0.0
 
             if not gate_open:
                 next_beep_monotonic = now
+                last_beep_started_monotonic = 0.0
                 time.sleep(FORCE_LOOP_SLEEP_S)
                 continue
 
-            cadence_force_kg = max(smoothed_force_kg, FORCE_ALERT_THRESHOLD_KG)
+            cadence_force_kg = max(current_force_kg, FORCE_ALERT_THRESHOLD_KG)
             interval_s = _get_force_alert_interval_s(cadence_force_kg)
             if interval_s is None:
                 next_beep_monotonic = now
                 time.sleep(FORCE_LOOP_SLEEP_S)
                 continue
 
+            if last_beep_started_monotonic > 0.0:
+                faster_next_beep = last_beep_started_monotonic + interval_s
+                if faster_next_beep < next_beep_monotonic:
+                    next_beep_monotonic = faster_next_beep
+
             if now + 0.002 < next_beep_monotonic:
-                time.sleep(min(0.01, max(0.0, next_beep_monotonic - now)))
+                time.sleep(min(FORCE_LOOP_SLEEP_S, max(0.0, next_beep_monotonic - now)))
                 continue
 
+            beep_started_monotonic = time.monotonic()
             try:
                 player.play_beep()
             except Exception as exc:
@@ -424,7 +422,8 @@ def _run_force_alert_loop(
                 next_beep_monotonic = time.monotonic() + FORCE_ALERT_RECOVERY_RETRY_S
                 continue
 
-            next_beep_monotonic = time.monotonic() + interval_s
+            last_beep_started_monotonic = beep_started_monotonic
+            next_beep_monotonic = beep_started_monotonic + interval_s
     finally:
         player.stop()
 
