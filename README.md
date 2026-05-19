@@ -195,7 +195,7 @@ consumes at runtime. This is more reliable than synthetic hotkeys for the 3D vie
 |---|---|---|---|---|
 | Button | `toggle_2d_3d` | 2D/3D display toggle | `display_mode_toggle.json` | Shared display-mode toggle request. The viewer sends `Alt+Q` on Windows when this file changes. |
 | Button | `alt_w_button` | Clarius overlay toggle | `clarius_overlay_toggle.json` | Show or hide the Clarius PiP overlay without disconnecting the Cast session. |
-| Button | `capture_clarius_button` | Clarius snapshot | `clarius_capture_request.json` | Save the current Clarius frame as a timestamped PNG in `clarius_captures`. |
+| Button | `capture_clarius_button` | Clarius + ZED snapshot | `clarius_capture_request.json` | Save timestamp-matched Clarius and ZED SBS PNG files in `clarius_captures`, show `CAPTURED`, and play a camera click. |
 | Button | `freeze_clarius_button` | Clarius freeze / unfreeze | `clarius_freeze_request.json` | Toggle the Clarius imaging state between live and frozen. This physical button is also the device's `Volume Up` consumer-control key, so the mapper restores the previous system volume after the press. |
 | Scroller up | `scroll_up` | Clarius contrast up | `clarius_contrast_up_request.json` | Increase the software contrast applied to the displayed Clarius PiP. |
 | Scroller down | `scroll_down` | Clarius contrast down | `clarius_contrast_down_request.json` | Decrease the software contrast applied to the displayed Clarius PiP. |

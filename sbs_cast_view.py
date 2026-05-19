@@ -8,6 +8,7 @@ and an optional force gauge fed through rosbridge.
 import argparse
 import ctypes
 from contextlib import contextmanager
+import io
 import json
 import math
 import os
@@ -18,6 +19,7 @@ import threading
 import time
 import socket
 import concurrent.futures
+import wave
 from typing import Callable, Dict, Iterator, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -69,6 +71,13 @@ DEFAULT_CLARIUS_CONTRAST_DOWN_STATE_FILE = SCRIPT_DIR / "clarius_contrast_down_r
 DEFAULT_OPERATOR_BUTTON_4_PLACEHOLDER_STATE_FILE = SCRIPT_DIR / "operator_button_4_placeholder.json"
 DEFAULT_CLARIUS_CAPTURE_DIR = SCRIPT_DIR / "clarius_captures"
 DEFAULT_FORCE_BRIDGE_URL = "http://127.0.0.1:8765/force"
+CAPTURE_CONFIRMATION_TEXT = "CAPTURED"
+CAPTURE_CONFIRMATION_SECONDS = 1.2
+CLARIUS_RECONNECT_INTERVAL_S = 2.0
+CLARIUS_INITIAL_FRAME_TIMEOUT_S = 8.0
+CLARIUS_FRAME_STALE_WARN_S = 2.0
+CLARIUS_FRAME_STALE_RECONNECT_S = 6.0
+CLARIUS_OVERLAY_OFF_NOTICE_SECONDS = 3.0
 FORCE_GAUGE_MAX_KG = 2.5
 FORCE_ALERT_THRESHOLD_KG = 1.5
 FORCE_ALERT_RELEASE_THRESHOLD_KG = 1.35
@@ -814,17 +823,132 @@ def _save_clarius_snapshot(
     frame: np.ndarray,
     output_dir: Path,
     prefix: str = "clarius",
+    timestamp: Optional[str] = None,
 ) -> Optional[Path]:
     """Save a Clarius frame to disk and return the written path."""
     if frame is None or frame.size == 0:
         return None
     output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    millis = int((time.time() % 1.0) * 1000)
-    path = output_dir / f"{prefix}_{timestamp}_{millis:03d}.png"
+    capture_timestamp = timestamp or _make_capture_timestamp()
+    path = output_dir / f"{prefix}_{capture_timestamp}.png"
     if cv2.imwrite(str(path), frame):
         return path
     return None
+
+
+def _make_capture_timestamp() -> str:
+    """Return one timestamp string that can be shared by paired captures."""
+    wall_time = time.time()
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(wall_time))
+    millis = int((wall_time % 1.0) * 1000)
+    return f"{timestamp}_{millis:03d}"
+
+
+def _frame_to_bgr(frame: np.ndarray) -> Optional[np.ndarray]:
+    if frame is None or frame.size == 0:
+        return None
+    if frame.ndim == 2:
+        return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    if frame.ndim != 3:
+        return None
+    channels = frame.shape[2]
+    if channels == 4:
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    if channels == 3:
+        return np.ascontiguousarray(frame)
+    if channels == 1:
+        return cv2.cvtColor(frame[:, :, 0], cv2.COLOR_GRAY2BGR)
+    return np.ascontiguousarray(frame[:, :, :3])
+
+
+def _save_zed_sbs_snapshot(
+    left_frame: np.ndarray,
+    right_frame: np.ndarray,
+    output_dir: Path,
+    timestamp: str,
+    prefix: str = "zed_sbs",
+) -> Optional[Path]:
+    """Save the current ZED left/right feed as one side-by-side image."""
+    left_bgr = _frame_to_bgr(left_frame)
+    right_bgr = _frame_to_bgr(right_frame)
+    if left_bgr is None or right_bgr is None:
+        return None
+    if left_bgr.shape[:2] != right_bgr.shape[:2]:
+        right_bgr = cv2.resize(
+            right_bgr,
+            (left_bgr.shape[1], left_bgr.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sbs_frame = np.ascontiguousarray(np.concatenate((left_bgr, right_bgr), axis=1))
+    path = output_dir / f"{prefix}_{timestamp}.png"
+    if cv2.imwrite(str(path), sbs_frame):
+        return path
+    return None
+
+
+_CAMERA_CLICK_WAV_BYTES: Optional[bytes] = None
+
+
+def _build_camera_click_wav() -> bytes:
+    sample_rate = 44100
+    duration_s = 0.16
+    sample_count = int(round(sample_rate * duration_s))
+    audio = np.zeros(sample_count, dtype=np.float32)
+    rng = np.random.default_rng(2443)
+
+    def add_click(start_s: float, click_s: float, tone_hz: float, gain: float) -> None:
+        start = int(round(start_s * sample_rate))
+        count = max(1, int(round(click_s * sample_rate)))
+        end = min(sample_count, start + count)
+        if end <= start:
+            return
+        idx = np.arange(end - start, dtype=np.float32)
+        envelope = np.exp(-idx / max(1.0, count * 0.28)).astype(np.float32)
+        tone = np.sin((2.0 * np.pi * tone_hz / sample_rate) * idx).astype(np.float32)
+        noise = rng.uniform(-1.0, 1.0, end - start).astype(np.float32)
+        audio[start:end] += gain * envelope * ((0.58 * noise) + (0.42 * tone))
+
+    add_click(0.000, 0.020, 3200.0, 0.85)
+    add_click(0.048, 0.032, 1500.0, 0.58)
+    add_click(0.095, 0.014, 4300.0, 0.28)
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm = (audio * 32767.0).astype(np.int16)
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm.tobytes())
+    return buffer.getvalue()
+
+
+def _get_camera_click_wav() -> bytes:
+    global _CAMERA_CLICK_WAV_BYTES
+    if _CAMERA_CLICK_WAV_BYTES is None:
+        _CAMERA_CLICK_WAV_BYTES = _build_camera_click_wav()
+    return _CAMERA_CLICK_WAV_BYTES
+
+
+def _play_camera_click_sound() -> None:
+    """Play a short non-blocking shutter-click sound on Windows."""
+    if sys.platform != "win32":
+        return
+
+    def play() -> None:
+        try:
+            winsound.PlaySound(_get_camera_click_wav(), winsound.SND_MEMORY)
+        except Exception:
+            try:
+                winsound.Beep(2600, 18)
+                time.sleep(0.035)
+                winsound.Beep(1200, 28)
+            except Exception:
+                pass
+
+    threading.Thread(target=play, name="CameraClickSound", daemon=True).start()
 
 
 def _apply_image_contrast(frame: np.ndarray, contrast: float) -> np.ndarray:
@@ -846,6 +970,7 @@ class ClariusCastReceiver:
     """Connects to a Clarius ultrasound probe via Cast API in a background thread."""
 
     def __init__(self, target_ip: str, port: int, pip_size: tuple) -> None:
+        self._requested_target_ip = target_ip
         self._target_ip = target_ip
         self._port = port
         self._pip_w, self._pip_h = pip_size
@@ -854,6 +979,11 @@ class ClariusCastReceiver:
         self._connected = False
         self._frozen = False
         self._cast = None
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._connected_at_monotonic = 0.0
+        self._last_frame_monotonic = 0.0
+        self._last_status = "not started"
         
         # FPS Tracking
         self._frame_count = 0
@@ -926,6 +1056,11 @@ class ClariusCastReceiver:
             with self._lock:
                 self._front_frame = bgr.copy()
                 self._frame_count += 1
+                self._last_frame_monotonic = time.monotonic()
+                if not self._connected:
+                    self._connected = True
+                    self._connected_at_monotonic = self._last_frame_monotonic
+                self._last_status = "streaming"
                 now = time.time()
                 if now - self._last_fps_time >= 1.0:
                     self._current_fps = self._frame_count / (now - self._last_fps_time)
@@ -948,7 +1083,8 @@ class ClariusCastReceiver:
         pass
 
     def _freezeFn(self, is_frozen):
-        self._frozen = is_frozen
+        with self._lock:
+            self._frozen = is_frozen
         print(f"[Clarius] Imaging {'FROZEN' if is_frozen else 'RUNNING'}")
 
     def start(self) -> bool:
@@ -956,16 +1092,17 @@ class ClariusCastReceiver:
             print("[Clarius] pyclariuscast not available")
             return False
 
-        if self._target_ip == "auto":
-            print(f"[Clarius] Auto-discovering probe on port {self._port}...")
-            discovered_ip = self._auto_discover_probe()
-            if discovered_ip:
-                self._target_ip = discovered_ip
-                print(f"[Clarius] Found probe at {self._target_ip}")
-            else:
-                print("[Clarius] Could not auto-discover probe.")
-                return False
+        with self._lock:
+            if self._running:
+                return True
+            self._running = True
+            self._last_status = "connecting"
 
+        self._thread = threading.Thread(target=self._run_connect_loop, name="ClariusCastReceiver", daemon=True)
+        self._thread.start()
+        return True
+
+    def _create_cast(self):
         # Keep strong references to callbacks to prevent garbage collection inside Boost.Python
         self._cb_processed = self._newProcessedImage
         self._cb_raw = self._newRawImage
@@ -974,7 +1111,7 @@ class ClariusCastReceiver:
         self._cb_freeze = self._freezeFn
         self._cb_buttons = self._buttonsFn
 
-        self._cast = pyclariuscast.Caster(
+        return pyclariuscast.Caster(
             self._cb_processed,
             self._cb_raw,
             self._cb_spectrum,
@@ -983,32 +1120,131 @@ class ClariusCastReceiver:
             self._cb_buttons
         )
 
-        ret = self._cast.init(self._keys_dir, 640, 480)
+    def _connect_once(self) -> bool:
+        target_ip = self._requested_target_ip
+        if target_ip == "auto":
+            with self._lock:
+                self._last_status = "discovering"
+            print(f"[Clarius] Auto-discovering probe on port {self._port}...")
+            discovered_ip = self._auto_discover_probe()
+            if not discovered_ip:
+                with self._lock:
+                    self._last_status = "probe not found"
+                print("[Clarius] Could not auto-discover probe.")
+                return False
+            target_ip = discovered_ip
+            self._target_ip = discovered_ip
+            print(f"[Clarius] Found probe at {self._target_ip}")
+
+        cast = self._create_cast()
+        ret = cast.init(self._keys_dir, 640, 480)
         if not ret:
+            with self._lock:
+                self._last_status = "init failed"
             print("[Clarius] Initialization failed!")
-            return False
-
-        print(f"[Clarius] Connecting to {self._target_ip}:{self._port}...")
-        ret = self._cast.connect(self._target_ip, self._port, "research")
-        if not ret:
-            print("[Clarius] Connection failed! Make sure App is running and connected.")
-            self._cast.destroy()
-            self._cast = None
-            return False
-
-        self._connected = True
-        print("[Clarius] Subscribed to live feed")
-        return True
-
-    def stop(self) -> None:
-        self._connected = False
-        if self._cast is not None:
             try:
-                self._cast.disconnect()
+                cast.destroy()
             except Exception:
                 pass
-            self._cast.destroy()
+            return False
+
+        with self._lock:
+            self._last_status = f"connecting {target_ip}:{self._port}"
+        print(f"[Clarius] Connecting to {target_ip}:{self._port}...")
+        ret = cast.connect(target_ip, self._port, "research")
+        if not ret:
+            with self._lock:
+                self._last_status = "connection failed"
+            print("[Clarius] Connection failed! Make sure App is running and connected.")
+            try:
+                cast.destroy()
+            except Exception:
+                pass
+            return False
+
+        now = time.monotonic()
+        with self._lock:
+            if not self._running:
+                should_destroy = True
+            else:
+                should_destroy = False
+                self._cast = cast
+                self._connected = True
+                self._connected_at_monotonic = now
+                self._last_status = "connected, waiting for frames"
+        if should_destroy:
+            try:
+                cast.disconnect()
+            except Exception:
+                pass
+            try:
+                cast.destroy()
+            except Exception:
+                pass
+            return False
+        print("[Clarius] Connected; waiting for live frames")
+        return True
+
+    def _run_connect_loop(self) -> None:
+        while True:
+            with self._lock:
+                running = self._running
+                connected = self._connected
+                connected_at = self._connected_at_monotonic
+                has_frame = self._front_frame is not None
+                last_frame_monotonic = self._last_frame_monotonic
+                frozen = self._frozen
+            if not running:
+                break
+
+            if connected:
+                if not has_frame and (time.monotonic() - connected_at) > CLARIUS_INITIAL_FRAME_TIMEOUT_S:
+                    print("[Clarius] Connected but no processed frames arrived; reconnecting.")
+                    self._disconnect_current_cast()
+                elif (
+                    has_frame
+                    and not frozen
+                    and last_frame_monotonic > 0.0
+                    and (time.monotonic() - last_frame_monotonic) > CLARIUS_FRAME_STALE_RECONNECT_S
+                ):
+                    print("[Clarius] Live frames stopped; reconnecting Cast.")
+                    self._disconnect_current_cast()
+                else:
+                    time.sleep(0.25)
+                continue
+
+            self._connect_once()
+            time.sleep(CLARIUS_RECONNECT_INTERVAL_S)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        self._disconnect_current_cast()
+
+    def _disconnect_current_cast(self) -> None:
+        with self._lock:
+            cast = self._cast
             self._cast = None
+            self._connected = False
+            self._front_frame = None
+            self._last_frame_monotonic = 0.0
+            self._current_fps = 0.0
+            if self._running:
+                self._last_status = "reconnecting"
+            else:
+                self._last_status = "stopped"
+        if cast is not None:
+            try:
+                cast.disconnect()
+            except Exception:
+                pass
+            try:
+                cast.destroy()
+            except Exception:
+                pass
 
     def get_frame(self) -> Optional[np.ndarray]:
         with self._lock:
@@ -1016,11 +1252,45 @@ class ClariusCastReceiver:
             
     def get_cast(self):
         """Expose the cast object directly for keyboard bindings."""
-        return self._cast
+        with self._lock:
+            return self._cast if self._connected else None
 
     def get_fps(self) -> float:
         with self._lock:
             return self._current_fps
+
+    def get_status_lines(self) -> list[str]:
+        with self._lock:
+            connected = self._connected
+            has_frame = self._front_frame is not None
+            last_frame_monotonic = self._last_frame_monotonic
+            last_status = self._last_status
+            target_ip = self._target_ip
+            fps = self._current_fps
+
+        if not connected:
+            return [f"Clarius: {last_status}", "Open Clarius app + enable Cast Research"]
+        if not has_frame:
+            return ["Clarius: connected, waiting for image", "Start imaging on the Clarius app/probe"]
+
+        age = time.monotonic() - last_frame_monotonic if last_frame_monotonic > 0.0 else 0.0
+        if age > CLARIUS_FRAME_STALE_WARN_S:
+            return [f"Clarius: last frame {age:.1f}s old", "Check freeze/app connection"]
+        return [f"Clarius: {target_ip} {fps:.1f} FPS"]
+
+    def is_connection_ok(self, max_frame_age_s: float) -> bool:
+        with self._lock:
+            connected = self._connected
+            has_frame = self._front_frame is not None
+            last_frame_monotonic = self._last_frame_monotonic
+            frozen = self._frozen
+        if not connected or not has_frame:
+            return False
+        if frozen:
+            return True
+        if last_frame_monotonic <= 0.0:
+            return False
+        return (time.monotonic() - last_frame_monotonic) <= max(0.5, max_frame_age_s)
 
 
 class ForceReceiver:
@@ -1482,6 +1752,49 @@ def _draw_filled_rounded_rect(image: np.ndarray, x: int, y: int, w: int, h: int,
     cv2.circle(image, (x + w - radius, y + h - radius), radius, color, -1, cv2.LINE_AA)
 
 
+def _draw_capture_confirmation(canvas: np.ndarray, text: str) -> None:
+    if canvas is None or canvas.size == 0 or not text:
+        return
+
+    height, width = canvas.shape[:2]
+    channels = canvas.shape[2] if canvas.ndim == 3 else 1
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.8, min(height, width) / 720.0)
+    thickness = max(2, int(round(font_scale * 2)))
+    text_size, baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    text_w, text_h = text_size
+    padding_x = max(18, int(round(text_w * 0.08)))
+    padding_y = max(10, int(round(text_h * 0.45)))
+    text_x = max(0, (width - text_w) // 2)
+    text_y = max(text_h + padding_y + 18, int(round(height * 0.12)))
+
+    panel_x = max(0, text_x - padding_x)
+    panel_y = max(0, text_y - text_h - padding_y)
+    panel_w = min(width - panel_x, text_w + (2 * padding_x))
+    panel_h = min(height - panel_y, text_h + baseline + (2 * padding_y))
+    if panel_w <= 0 or panel_h <= 0:
+        return
+
+    roi = canvas[panel_y:panel_y + panel_h, panel_x:panel_x + panel_w]
+    overlay = roi.copy()
+    panel_color = (12, 18, 16, 235) if channels == 4 else (12, 18, 16)
+    _draw_filled_rounded_rect(
+        overlay,
+        0,
+        0,
+        panel_w - 1,
+        panel_h - 1,
+        max(10, panel_h // 4),
+        panel_color,
+    )
+    roi[:] = cv2.addWeighted(roi, 0.35, overlay, 0.65, 0)
+
+    shadow_color = (0, 0, 0, 255) if channels == 4 else (0, 0, 0)
+    text_color = (70, 255, 150, 255) if channels == 4 else (70, 255, 150)
+    cv2.putText(canvas, text, (text_x + 2, text_y + 2), font, font_scale, shadow_color, thickness + 2, cv2.LINE_AA)
+    cv2.putText(canvas, text, (text_x, text_y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+
 def _draw_voice_meter(
     canvas: np.ndarray,
     value: float,
@@ -1588,6 +1901,43 @@ def _draw_text_block(
         cv2.putText(canvas, line, (x, baseline_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
 
 
+def _draw_status_panel(
+    canvas: np.ndarray,
+    lines: list[str],
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+) -> None:
+    if canvas is None or canvas.size == 0 or not lines:
+        return
+
+    ch, cw = canvas.shape[:2]
+    x = max(0, min(x, max(0, cw - 2)))
+    y = max(0, min(y, max(0, ch - 2)))
+    w = max(2, min(w, cw - x))
+    h = max(2, min(h, ch - y))
+    roi = canvas[y:y + h, x:x + w]
+    overlay = roi.copy()
+    channels = canvas.shape[2] if canvas.ndim == 3 else 1
+    panel_color = (8, 10, 12, 235) if channels == 4 else (8, 10, 12)
+    _draw_filled_rounded_rect(overlay, 0, 0, w - 1, h - 1, max(8, min(w, h) // 8), panel_color)
+    roi[:] = cv2.addWeighted(roi, 0.25, overlay, 0.75, 0)
+
+    text_x = x + max(10, w // 18)
+    text_y = y + max(28, h // 5)
+    _draw_text_block(
+        canvas,
+        lines,
+        text_x,
+        text_y,
+        color=(0, 255, 255),
+        font_scale=max(0.45, min(w, h) / 420.0),
+        thickness=1,
+        line_height=max(18, h // 6),
+    )
+
+
 def _poll_key() -> int:
     if hasattr(cv2, "pollKey"):
         try:
@@ -1636,6 +1986,61 @@ def _parse_force_endpoint_payload(payload: dict) -> tuple[float, bool, str]:
         status_text = default_status
 
     return max(0.0, force_kg), connected, status_text
+
+
+def _force_connection_failed(force_receiver: Optional[object], use_force: bool) -> bool:
+    if not use_force:
+        return False
+    if force_receiver is None:
+        return True
+
+    is_worker_alive = getattr(force_receiver, "is_worker_alive", None)
+    if callable(is_worker_alive) and not is_worker_alive():
+        return True
+
+    has_recent_message = getattr(force_receiver, "has_recent_message", None)
+    if callable(has_recent_message):
+        return not bool(has_recent_message(1.5))
+    return False
+
+
+def _clarius_connection_failed(
+    clarius_receiver: Optional[ClariusCastReceiver],
+    use_clarius: bool,
+) -> bool:
+    if not use_clarius:
+        return False
+    if clarius_receiver is None:
+        return True
+    return not clarius_receiver.is_connection_ok(CLARIUS_FRAME_STALE_RECONNECT_S)
+
+
+def _button_signal_paths_failed(paths: list[str | os.PathLike[str]]) -> bool:
+    for path_text in paths:
+        parent = Path(path_text).expanduser().parent
+        if not parent.exists():
+            return True
+    return False
+
+
+def _viewer_status_text(
+    *,
+    zed_connection_ok: bool,
+    force_receiver: Optional[object],
+    use_force: bool,
+    clarius_receiver: Optional[ClariusCastReceiver],
+    use_clarius: bool,
+    button_signal_paths: list[str | os.PathLike[str]],
+) -> str:
+    if not zed_connection_ok:
+        return "ZED connection failed"
+    if _force_connection_failed(force_receiver, use_force):
+        return "Force connection failed"
+    if _clarius_connection_failed(clarius_receiver, use_clarius):
+        return "Clarius connection failed"
+    if _button_signal_paths_failed(button_signal_paths):
+        return "Button connection failed"
+    return "OK"
 
 
 def _probe_force_bridge(url: str, timeout_s: float) -> bool:
@@ -1766,7 +2171,7 @@ def parse_args() -> argparse.Namespace:
     clarius.add_argument(
         "--clarius-capture-dir",
         default=str(DEFAULT_CLARIUS_CAPTURE_DIR),
-        help="Directory where Clarius snapshot PNG files are saved.",
+        help="Directory where paired Clarius and ZED snapshot PNG files are saved.",
     )
     clarius.add_argument(
         "--clarius-freeze-file",
@@ -1950,7 +2355,7 @@ def main() -> None:
         try:
             clarius_receiver = ClariusCastReceiver(args.clarius_ip, args.clarius_port, (pip_w, pip_h))
             if clarius_receiver.start():
-                print(f"[Clarius] PiP {pip_w}x{pip_h}px on {eye_width}x{eye_height} eye")
+                print(f"[Clarius] PiP {pip_w}x{pip_h}px on {eye_width}x{eye_height} eye; background connector running")
             else:
                 clarius_receiver = None
         except Exception as exc:
@@ -2036,6 +2441,7 @@ def main() -> None:
     last_clarius_frame = None
     cached_pip = None
     clarius_overlay_visible = clarius_receiver is not None
+    clarius_overlay_off_notice_until = 0.0
     display_mode = args.start_display_mode.lower()
     display_toggle_reader = StateFileEventReader(args.display_toggle_file)
     clarius_toggle_reader = StateFileEventReader(args.clarius_toggle_file)
@@ -2044,6 +2450,15 @@ def main() -> None:
     clarius_contrast_up_reader = StateFileEventReader(args.clarius_contrast_up_file)
     clarius_contrast_down_reader = StateFileEventReader(args.clarius_contrast_down_file)
     button4_placeholder_reader = StateFileEventReader(args.button4_placeholder_file)
+    button_signal_paths = [
+        args.display_toggle_file,
+        args.clarius_toggle_file,
+        args.clarius_capture_file,
+        args.clarius_freeze_file,
+        args.clarius_contrast_up_file,
+        args.clarius_contrast_down_file,
+        args.button4_placeholder_file,
+    ]
     display_toggle_cooldown_sec = 1.5
     clarius_toggle_cooldown_sec = 1.0
     clarius_capture_cooldown_sec = 1.0
@@ -2053,6 +2468,7 @@ def main() -> None:
     last_clarius_capture_at = 0.0
     last_button4_placeholder_at = 0.0
     clarius_capture_dir = Path(args.clarius_capture_dir)
+    capture_confirmation_until = 0.0
     clarius_contrast = 1.0
     clarius_contrast_step = 0.15
     clarius_min_contrast = 0.55
@@ -2062,6 +2478,8 @@ def main() -> None:
     suppress_q_quit_until = 0.0
     sbs_compose_buffer: Optional[np.ndarray] = None
     output_frame_buffer: Optional[np.ndarray] = None
+    zed_connection_ok = True
+    zed_grab_failure_count = 0
     profile_enabled = args.profile_components or args.profile_overlay
     profiler = ComponentProfiler(profile_enabled, args.profile_interval)
     if profile_enabled:
@@ -2074,7 +2492,12 @@ def main() -> None:
             with profiler.section("grab"):
                 grab_status = camera.grab(runtime)
             if grab_status != sl.ERROR_CODE.SUCCESS:
+                zed_grab_failure_count += 1
+                if zed_grab_failure_count >= 30:
+                    zed_connection_ok = False
                 continue
+            zed_grab_failure_count = 0
+            zed_connection_ok = True
                 
             zed_frame_count += 1
             now = time.time()
@@ -2110,6 +2533,11 @@ def main() -> None:
                     if (now_monotonic - last_clarius_toggle_at) >= clarius_toggle_cooldown_sec:
                         last_clarius_toggle_at = now_monotonic
                         clarius_overlay_visible = not clarius_overlay_visible
+                        clarius_overlay_off_notice_until = (
+                            now_monotonic + CLARIUS_OVERLAY_OFF_NOTICE_SECONDS
+                            if not clarius_overlay_visible
+                            else 0.0
+                        )
                         print(
                             f"[Clarius] Overlay {'ON' if clarius_overlay_visible else 'OFF'} (file)"
                         )
@@ -2118,12 +2546,25 @@ def main() -> None:
                     if (now_monotonic - last_clarius_capture_at) >= clarius_capture_cooldown_sec:
                         last_clarius_capture_at = now_monotonic
                         capture_frame = clarius_receiver.get_frame()
+                        capture_timestamp = _make_capture_timestamp()
                         saved_path = _save_clarius_snapshot(
                             capture_frame,
                             clarius_capture_dir,
+                            timestamp=capture_timestamp,
                         )
                         if saved_path is not None:
-                            print(f"[Clarius] Snapshot saved: {saved_path}")
+                            zed_path = _save_zed_sbs_snapshot(
+                                left_img,
+                                right_img,
+                                clarius_capture_dir,
+                                capture_timestamp,
+                            )
+                            capture_confirmation_until = now_monotonic + CAPTURE_CONFIRMATION_SECONDS
+                            _play_camera_click_sound()
+                            if zed_path is not None:
+                                print(f"[Capture] Saved Clarius: {saved_path} | ZED: {zed_path}")
+                            else:
+                                print(f"[Capture] Saved Clarius: {saved_path} | ZED save failed")
                         else:
                             print("[Clarius] Snapshot request ignored: no frame available")
 
@@ -2175,6 +2616,10 @@ def main() -> None:
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                                 cv2.putText(right_img, "FROZEN", (right_pip_x + 10, right_pip_y + 30), 
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    else:
+                        status_lines = clarius_receiver.get_status_lines()
+                        _draw_status_panel(left_img, status_lines, left_pip_x, left_pip_y, pip_w, min(pip_h, max(96, pip_h // 3)))
+                        _draw_status_panel(right_img, status_lines, right_pip_x, right_pip_y, pip_w, min(pip_h, max(96, pip_h // 3)))
 
             with profiler.section("force"):
                 if force_receiver is not None:
@@ -2198,14 +2643,35 @@ def main() -> None:
                     _draw_force_bar(right_img, displayed_force_kg, right_gauge_x, right_gauge_y, gauge_w, gauge_h)
 
             with profiler.section("hud"):
-                clarius_fps = clarius_receiver.get_fps() if clarius_receiver else 0.0
-                fps_text = f"Mode: {display_mode.upper()} | ZED FPS: {zed_fps:.1f} | Clarius FPS: {clarius_fps:.1f}"
-                cv2.putText(left_img, fps_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                cv2.putText(right_img, fps_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                status_text = _viewer_status_text(
+                    zed_connection_ok=zed_connection_ok,
+                    force_receiver=force_receiver,
+                    use_force=use_force,
+                    clarius_receiver=clarius_receiver,
+                    use_clarius=use_clarius,
+                    button_signal_paths=button_signal_paths,
+                )
+                hud_text = f"Mode: {display_mode.upper()} | Status: {status_text}"
+                hud_color = (0, 255, 0) if status_text == "OK" else (0, 120, 255)
+                cv2.putText(left_img, hud_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(right_img, hud_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv2.LINE_AA)
+                cv2.putText(left_img, hud_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, hud_color, 2, cv2.LINE_AA)
+                cv2.putText(right_img, hud_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, hud_color, 2, cv2.LINE_AA)
                 if args.profile_overlay:
                     profile_lines = profiler.get_overlay_lines()
                     _draw_text_block(left_img, profile_lines, 20, 66)
                     _draw_text_block(right_img, profile_lines, 20, 66)
+                if (
+                    clarius_receiver is not None
+                    and not clarius_overlay_visible
+                    and time.monotonic() < clarius_overlay_off_notice_until
+                ):
+                    overlay_lines = ["Clarius overlay OFF", "Press Alt+W or overlay button"]
+                    _draw_text_block(left_img, overlay_lines, 20, 92, color=(0, 255, 255))
+                    _draw_text_block(right_img, overlay_lines, 20, 92, color=(0, 255, 255))
+                if time.monotonic() < capture_confirmation_until:
+                    _draw_capture_confirmation(left_img, CAPTURE_CONFIRMATION_TEXT)
+                    _draw_capture_confirmation(right_img, CAPTURE_CONFIRMATION_TEXT)
 
             with profiler.section("compose"):
                 if display_mode == "2d":
@@ -2242,6 +2708,11 @@ def main() -> None:
                 alt_w_down = _is_alt_w_pressed()
                 if alt_w_down and not alt_w_was_down and clarius_receiver is not None:
                     clarius_overlay_visible = not clarius_overlay_visible
+                    clarius_overlay_off_notice_until = (
+                        input_now_monotonic + CLARIUS_OVERLAY_OFF_NOTICE_SECONDS
+                        if not clarius_overlay_visible
+                        else 0.0
+                    )
                     print(
                         f"[Clarius] Overlay {'ON' if clarius_overlay_visible else 'OFF'}"
                     )
